@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       approval: # 승인 팀
-        description: '(PROD만 해당) 배포 승인자 지정'
+        description: '(PROD만 해당) 배포 승인자 지정 '
         required: true
         type: choice
         options:
