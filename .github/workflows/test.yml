@@ -1,0 +1,171 @@
+# ====================================================================================== #
+#
+#  Workflow : AWS EC2 CI 파이프라인
+#
+#  Workflow 설명 :
+#    - 바이너리 및 라이브러리를 S3 Bucket에 업로드
+#    - 바이너리 및 라이브러리를 MMSS 서버 code deploy 통하여 업로드
+#
+#  버전 : v0.9.4
+#
+# ====================================================================================== #
+name: mmss-send
+
+on:
+  push:
+    branches:
+      - main
+      - qa
+  workflow_dispatch:
+    inputs:
+      approval: # 승인 팀
+        description: '(PROD만 해당) 배포 승인자 지정'
+        required: true
+        type: choice
+        options:
+          - 'IT-Admin'
+          - 'QA-PM'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # AWS 변수
+  AWS_REGION: ap-northeast-2
+  ORG_NAME: msg
+  GIT_REPO_NAME: ${{ github.event.repository.name }}
+  BIN_BASE_NAME: mmsr_bin
+  LIB_BASE_NAME: mmsr_lib
+  CLASS_PATH_INFO: classPathInfo
+
+jobs:
+  env-set:
+    name: 1. CD 환경 결정
+    runs-on: ubuntu-latest
+    outputs:
+      cd-env: ${{ steps.cd-env-set.outputs.cd-env }}
+    steps:
+      - name: Binary Repository Checkout
+        uses: actions/checkout@v4
+
+      - name: Workflow Dispatch 확인
+        if: github.ref_name != 'main' && github.event_name == 'workflow_dispatch'
+        run: |
+          echo "### 에러: Workflow Dispatch는 prd 전용입니다." >> ${GITHUB_STEP_SUMMARY}
+          echo "배포 환경 : "${{ github.ref_name }} >> ${GITHUB_STEP_SUMMARY}
+          echo "배포 트리거 : "${{ github.event_name }} >> ${GITHUB_STEP_SUMMARY}
+          exit 1
+
+      - name: DEV 배포
+        if: github.ref_name == 'dev'
+        run: |
+          echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+
+      - name: QA 배포
+        if: github.ref_name == 'qa'
+        run: |
+          echo "DEPLOY_ENV=qa" >> $GITHUB_ENV
+
+      - name: prd 배포 - Push
+        if: startsWith(github.ref, 'refs/heads/main') && github.event_name == 'push'
+        run: |
+          COMMIT_MSG=`git log --format=%B -n 1 ${{ github.event.after }}`
+          FROM_BUILD=`echo ${COMMIT_MSG} | grep "From Build" | wc -l`
+          FROM_ROLLBACK=`echo ${COMMIT_MSG} | grep "Rollback To" | wc -l`
+
+          if [[ ${FROM_BUILD} == "1" || ${FROM_ROLLBACK} == "1" ]]
+          then
+            echo "DEPLOY_ENV=prd_from_build" >> $GITHUB_ENV
+          else
+            echo "DEPLOY_ENV=prd_skip_deploy" >> $GITHUB_ENV
+          fi
+
+      - name: prd 배포 - Workflow Dispatch
+        if: startsWith(github.ref, 'refs/heads/main') && github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ ${{ inputs.approval }} == "QA-PM" ]]
+          then
+            echo "DEPLOY_ENV=prd_qa" >> $GITHUB_ENV
+          elif [[ ${{ inputs.approval }} == "IT-Admin" ]]
+          then
+            echo "DEPLOY_ENV=prd_it" >> $GITHUB_ENV
+          else
+            exit 1
+          fi
+
+      - name: CD 환경 설정
+        id: cd-env-set
+        run: |
+          echo "cd-env=${DEPLOY_ENV}" >> $GITHUB_OUTPUT
+
+          echo "### === CD 환경 설정 ===" >> ${GITHUB_STEP_SUMMARY}
+          echo "배포 환경 : "${{ github.ref_name }} >> ${GITHUB_STEP_SUMMARY}
+          echo "배포 트리거 : "${{ github.event_name }} >> ${GITHUB_STEP_SUMMARY}
+          if [[ ${{ github.event_name }} == 'workflow_dispatch' && ${{ github.ref_name }} == 'refs/heads/main' ]]
+          then
+            echo "배포 승인자 지정 : "${{ inputs.approval }} >> ${GITHUB_STEP_SUMMARY}
+          fi
+
+  # 2.1 QA PM 승인
+  QA-PM-approval:
+    name: (prd) 2.1 QA PM 승인
+    needs: env-set
+    if: |
+      needs.env-set.outputs.cd-env == 'prd_from_build' ||
+      needs.env-set.outputs.cd-env == 'prd_qa'
+    runs-on: ubuntu-latest
+    environment: QA-PM
+
+    steps:
+      - name: QA PM 승인
+        run: echo "QA PM 승인 완료"
+
+  # 2.2 QA Admin 승인
+  QA-Admin-approval:
+    name: (prd) 2.2 QA Admin 승인 - 배포 진행
+    needs: QA-PM-approval
+    runs-on: ubuntu-latest
+    environment: QA-Admin
+
+    steps:
+      - name: QA_Admin 승인
+        run: echo "QA_Admin 승인 완료"
+
+  # 2. IT Admin 승인
+  IT-Admin-approval:
+    name: (prd) 2. IT Admin 승인 - 배포 진행
+    needs: env-set
+    if: |
+      needs.env-set.outputs.cd-env == 'prd_it'
+    runs-on: ubuntu-latest
+    environment: IT-Admin
+
+    steps:
+      - name: IT_Admin 승인
+        run: echo "IT_Admin 승인"
+
+  # 3. Binary 확인
+  check-binary:
+    name: Test
+    if: |
+      always() &&
+      needs.env-set.outputs.cd-env != 'prd_skip_deploy' &&
+      contains(join(needs.env-set.result, ','), 'success') &&
+      !contains(join(needs.QA-PM-approval.result, ','), 'failure') && !contains(join(needs.QA-PM-approval.result, ','), 'cancelled') &&
+      !contains(join(needs.QA-Admin-approval.result, ','), 'failure') && !contains(join(needs.QA-Admin-approval.result, ','), 'cancelled') &&
+      !contains(join(needs.IT-Admin-approval.result, ','), 'failure') && !contains(join(needs.IT-Admin-approval.result, ','), 'cancelled')
+    needs: [env-set, QA-PM-approval, QA-Admin-approval, IT-Admin-approval]
+    outputs:
+      binary_flag: ${{ steps.check_files.outputs.binary_flag }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Binary Repository Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Commit 변경 파일 확인
+        id: check_files
+        run: |
+          echo "TEST" >> ${GITHUB_STEP_SUMMARY}
